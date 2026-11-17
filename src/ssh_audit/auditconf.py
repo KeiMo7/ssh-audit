@@ -52,6 +52,7 @@ class AuditConf:
         self.timeout_set = False  # Set to True when the user explicitly sets it.
         self.target_file: Optional[str] = None
         self.target_list: List[str] = []
+        self.target_locations: List[Tuple[int, int, int]] = []  # SARIF source-line, start column, end column.
         self.threads = 32
         self.list_policies = False
         self.lookup = ''
@@ -68,6 +69,8 @@ class AuditConf:
         self.conn_rate_test_threads = 0
         self.conn_rate_test_target_rate = 0
         self.socks5_proxy: Optional[str] = None  # SOCKS5 proxy in "host:port" format
+        self.sarif_output: Optional[str] = None  # File path for SARIF 2.1.0 output.
+        self.sarif_baseline: Optional[str] = None  # Optional prior SARIF file used for baselineState.
 
 
     def __setattr__(self, name: str, value: Union[str, int, float, bool, Sequence[int]]) -> None:
@@ -96,7 +99,7 @@ class AuditConf:
             if value == -1.0:
                 raise ValueError('invalid timeout: {}'.format(value))
             valid = True
-        elif name in ['ip_version_preference', 'lookup', 'policy_file', 'policy', 'target_file', 'target_list', 'gex_test']:
+        elif name in ['ip_version_preference', 'lookup', 'policy_file', 'policy', 'target_file', 'target_list', 'target_locations', 'gex_test', 'sarif_output', 'sarif_baseline']:
             valid = True
         elif name == "threads":
             valid, num_threads = True, Utils.parse_int(value)

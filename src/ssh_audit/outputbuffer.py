@@ -50,6 +50,7 @@ class OutputBuffer:
         self.debug = False
         self.use_colors = True
         self.json = False
+        self.finding_recorder: Optional[Callable[[str, str, str, str], None]] = None
         self.__level = 0
         self.__is_color_supported = ('colorama' in sys.modules) or (os.name == 'posix')
         self.line_ended = True
@@ -184,4 +185,10 @@ class OutputBuffer:
             if write_now:
                 self.write()
 
+        return self
+
+    def record_finding(self, category: str, algorithm: str, level: str, message: str) -> 'OutputBuffer':
+        '''Reports a structured finding to an optional recorder without changing text output.'''
+        if self.finding_recorder is not None:
+            self.finding_recorder(category, algorithm, level, message)
         return self

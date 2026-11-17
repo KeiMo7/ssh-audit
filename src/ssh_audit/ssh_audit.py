@@ -56,6 +56,8 @@ from ssh_audit.policy import Policy
 from ssh_audit.hardening_guides import Hardening_Guides
 from ssh_audit.product import Product
 from ssh_audit.protocol import Protocol
+from ssh_audit.sarif import SarifWriter
+from ssh_audit.sarif import artifact_uri, find_repository_root, synthetic_target_uri
 from ssh_audit.software import Software
 from ssh_audit.ssh2_kex import SSH2_Kex
 from ssh_audit.ssh2_kexdb import SSH2_KexDB
@@ -168,6 +170,14 @@ def output_algorithm(out: OutputBuffer, alg_db: Dict[str, Dict[str, List[List[Op
 
         f = getattr(out, level)
         comment = (padding + ' -- [' + level + '] ' + text) if text != '' else ''
+        if text != '' and getattr(out, 'finding_recorder', None) is not None:
+            category = {
+                'kex': 'kex',
+                'key': 'host-key',
+                'enc': 'cipher',
+                'mac': 'mac',
+            }[alg_type]
+            out.record_finding(category, alg_name_original, level, '%s: %s' % (alg_name_original, text))
 
         # If the first algorithm's comment is an 'info', this implies that it is rated good.  Hence, the out.good() function should be used to write all subsequent notes for this algorithm as well.
         if (first and level == 'info') or use_good_for_all:
@@ -223,6 +233,8 @@ def output_security(out: OutputBuffer, banner: Optional[Banner], padlen: int, is
         if (banner is not None) and (banner.protocol[0] == 1):
             p = '' if out.batch else ' ' * (padlen - 14)
             out.fail('(sec) SSH v1 enabled{} -- SSH v1 can be exploited to recover plaintext passwords'.format(p))
+            if getattr(out, 'finding_recorder', None) is not None:
+                out.record_finding('security', 'ssh-v1', 'fail', 'SSH v1 enabled; it can be exploited to recover plaintext passwords')
 
     if not out.is_section_empty() and not is_json_output:
         out.head('# security')
@@ -596,6 +608,12 @@ def evaluate_policy(out: OutputBuffer, aconf: AuditConf, banner: Optional['Banne
         raise RuntimeError('Internal error: cannot evaluate against null Policy!')
 
     passed, error_struct, error_str = aconf.policy.evaluate(banner, kex)
+    if getattr(out, 'finding_recorder', None) is not None:
+        for error in error_struct:
+            mismatched_field = str(error.get('mismatched_field', 'policy'))
+            expected: Any = error.get('expected_required', [])
+            actual: Any = error.get('actual', [])
+            out.record_finding('policy', mismatched_field, 'fail', '%s did not match policy (expected: %s; actual: %s)' % (mismatched_field, expected, actual))
     if aconf.json:
         warnings: List[str] = []
         if aconf.policy.is_outdated_builtin_policy():
@@ -794,6 +812,8 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     parser.add_argument("--get-hardening-guide", action="store", metavar="platform", dest="get_hardening_guide", type=str, default=None, help="retrieves the hardening guide for the specified platform name (use --list-hardening-guides to see list of available guides).")
     parser.add_argument("--list-hardening-guides", action="store_true", dest="list_hardening_guides", default=False, help="list all official, built-in hardening guides for common systems.  Their full names can then be passed to --get-hardening-guide.  Add -v to this option to view hardening guide change logs and prior versions.")
     parser.add_argument("--lookup", action="store", dest="lookup", metavar="alg1[,alg2,...]", type=str, default=None, help="looks up an algorithm(s) without connecting to a server.")
+    parser.add_argument("--sarif", "--sarif-output", action="store", dest="sarif_output", metavar="FILE", type=str, default=None, help="write SARIF 2.1.0 results to FILE (existing SARIF at the same path is used as the baseline)")
+    parser.add_argument("--sarif-baseline", action="store", dest="sarif_baseline", metavar="FILE", type=str, default=None, help="compare SARIF output against a prior SARIF file to set baselineState")
     parser.add_argument("--skip-rate-test", action="store_true", dest="skip_rate_test", default=False, help="skip the connection rate test during standard audits (used to safely infer whether the DHEat attack is viable)")
     parser.add_argument("--socks5", action="store", dest="socks5_proxy", metavar="host:port", type=str, default=None, help="connect via a SOCKS5 proxy (implies --skip-rate-test)")
     parser.add_argument("--threads", action="store", dest="threads", metavar="N", type=int, default=32, help="number of threads to use when scanning multiple targets (-T/--targets) (default: %(default)s)")
@@ -880,6 +900,18 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
         if argument.lookup is not None:
             aconf.lookup = argument.lookup
 
+        if argument.sarif_output is not None:
+            aconf.sarif_output = argument.sarif_output
+
+        if argument.sarif_baseline is not None:
+            aconf.sarif_baseline = argument.sarif_baseline
+
+        if (aconf.sarif_baseline is not None) and (aconf.sarif_output is None):
+            raise ValueError('--sarif-baseline requires --sarif')
+
+        if aconf.sarif_output is not None and (argument.manual or aconf.lookup != '' or aconf.list_policies or argument.list_hardening_guides or argument.get_hardening_guide is not None):
+            raise ValueError('--sarif is only supported for audit scans')
+
         if argument.make_policy is not None:
             aconf.make_policy = True
             aconf.policy_file = argument.make_policy
@@ -956,7 +988,7 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     if aconf.target_file is not None:
         try:
             with open(aconf.target_file, 'r', encoding='utf-8') as f:
-                aconf.target_list = f.readlines()
+                target_lines = f.readlines()
         except PermissionError as e:
             # If installed as a Snap package, print a more useful message with potential work-arounds.
             if SNAP_PACKAGE:
@@ -966,7 +998,16 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
             sys.exit(exitcodes.UNKNOWN_ERROR)
 
         # Strip out whitespace from each line in target file, and skip empty lines.
-        aconf.target_list = [target.strip() for target in aconf.target_list if target not in ("", "\n")]
+        aconf.target_list = []
+        target_locations = []
+        for line_number, raw_target in enumerate(target_lines, start=1):
+            if raw_target in ("", "\n"):
+                continue
+            stripped = raw_target.strip()
+            aconf.target_list.append(stripped)
+            start_column = len(raw_target) - len(raw_target.lstrip()) + 1
+            target_locations.append((line_number, start_column, start_column + len(stripped)))
+        aconf.target_locations = target_locations
 
     # If a policy file was provided, validate it.
     if (aconf.policy_file is not None) and (aconf.make_policy is False):
@@ -1152,13 +1193,15 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
 
 
 # Returns one of the exitcodes.* flags.
-def audit(out: OutputBuffer, aconf: AuditConf, print_target: bool = False) -> int:
+def audit(out: OutputBuffer, aconf: AuditConf, print_target: bool = False, sarif_writer: Optional[SarifWriter] = None, sarif_location: Optional[Dict[str, object]] = None, sarif_target: str = '') -> int:
     program_retval = exitcodes.GOOD
     out.batch = aconf.batch
     out.verbose = aconf.verbose
     out.debug = aconf.debug
     out.level = aconf.level
     out.use_colors = aconf.colors
+    if sarif_writer is not None and sarif_location is not None:
+        out.finding_recorder = sarif_writer.recorder(sarif_location, sarif_target)
     s = SSH_Socket(out, aconf.host, aconf.port, aconf.ip_version_preference, aconf.timeout, aconf.timeout_set, aconf.socks5_proxy)
 
     if aconf.client_audit:
@@ -1332,8 +1375,8 @@ def algorithm_lookup(out: OutputBuffer, alg_names: str) -> int:
 
 
 # Worker thread for scanning multiple targets concurrently.
-def target_worker_thread(host: str, port: int, shared_aconf: AuditConf) -> Tuple[int, str]:
-    ret = -1
+def target_worker_thread(host: str, port: int, shared_aconf: AuditConf, sarif_writer: Optional[SarifWriter] = None, sarif_location: Optional[Dict[str, object]] = None, sarif_target: str = '') -> Tuple[int, str]:
+    ret = exitcodes.UNKNOWN_ERROR
     string_output = ''
 
     out = OutputBuffer()
@@ -1348,12 +1391,23 @@ def target_worker_thread(host: str, port: int, shared_aconf: AuditConf) -> Tuple
         out.use_colors = False
 
     out.v("Running against: %s:%d..." % (my_aconf.host, my_aconf.port), write_now=True)
+    invocation_id: Optional[int] = None
     try:
-        ret = audit(out, my_aconf, print_target=True)
+        if sarif_writer is not None:
+            invocation_id = sarif_writer.begin_invocation('ssh-audit', sarif_target)
+            if sarif_location is not None:
+                out.finding_recorder = sarif_writer.recorder(sarif_location, sarif_target)
+        ret = audit(out, my_aconf, print_target=True, sarif_writer=sarif_writer, sarif_location=sarif_location, sarif_target=sarif_target)
         string_output = out.get_buffer()
-    except Exception:
-        ret = -1
+    except Exception as err:
+        ret = exitcodes.UNKNOWN_ERROR
         string_output = "An exception occurred while scanning %s:%d:\n%s" % (host, port, str(traceback.format_exc()))
+        if sarif_writer is not None and invocation_id is not None:
+            sarif_writer.finish_invocation(invocation_id, False, ret, str(err))
+    else:
+        if sarif_writer is not None and invocation_id is not None:
+            success = ret in (exitcodes.GOOD, exitcodes.WARNING, exitcodes.FAILURE)
+            sarif_writer.finish_invocation(invocation_id, success, ret, '' if success else 'connection or audit execution failed')
 
     return ret, string_output
 
@@ -1448,6 +1502,47 @@ def run_gex_granular_modulus_size_test(out: OutputBuffer, s: 'SSH_Socket', kex: 
     return program_retval
 
 
+def _sarif_location(aconf: AuditConf, repo_root: str, target: str, line: int, start_column: int, end_column: int) -> Dict[str, object]:
+    '''Builds a stable physical location for a target-list line or a synthetic single-target file.'''
+
+    if aconf.target_file is not None:
+        uri = artifact_uri(aconf.target_file, repo_root)
+    else:
+        uri = synthetic_target_uri(aconf.host if len(aconf.host) > 0 else target, aconf.port, aconf.client_audit)
+    return {
+        'artifact_uri': uri,
+        'start_line': line,
+        'start_column': start_column,
+        'end_line': line,
+        'end_column': max(end_column, start_column),
+    }
+
+
+def _sarif_execution_succeeded(ret: int) -> bool:
+    return ret in (exitcodes.GOOD, exitcodes.WARNING, exitcodes.FAILURE)
+
+
+def _sarif_failure_text(err: BaseException) -> str:
+    text = str(err)
+    if isinstance(err, SystemExit):
+        text = 'exit code %s' % str(err.code)
+    if len(text) == 0:
+        text = err.__class__.__name__
+    return text
+
+
+def _fail_sarif_writer(out: OutputBuffer, sarif_writer: SarifWriter, message: str) -> None:
+    '''Finalizes a valid SARIF document with a failed invocation, or leaves no output file.'''
+
+    try:
+        sarif_writer.finalize(True)
+    except Exception as err:
+        sarif_writer.cleanup()
+        out.fail('(sarif) failure: %s: %s' % (message, str(err)), write_now=True)
+    else:
+        out.fail('(sarif) failure: %s' % message, write_now=True)
+
+
 def main() -> int:
     out = OutputBuffer()
     aconf = process_commandline(out, sys.argv[1:])
@@ -1475,6 +1570,17 @@ def main() -> int:
         out.write()
         sys.exit(retval)
 
+    sarif_writer: Optional[SarifWriter] = None
+    repo_root = find_repository_root()
+    if aconf.sarif_output is not None:
+        try:
+            sarif_writer = SarifWriter(aconf.sarif_output, repo_root=repo_root, baseline_path=aconf.sarif_baseline, tool_version=VERSION)
+        except Exception as err:
+            out.fail('(sarif) failure: %s' % str(err), write_now=True)
+            return exitcodes.UNKNOWN_ERROR
+        out.info('(sarif) enter: writing %s' % os.path.basename(aconf.sarif_output))
+        out.write()
+
     # If multiple targets were specified...
     if len(aconf.target_list) > 0:
         ret = exitcodes.GOOD
@@ -1484,10 +1590,17 @@ def main() -> int:
             print('[', end='')
 
         # Loop through each target in the list.  Entries can specify a port number to use, otherwise the value provided on the command line (--port=N) will be used by default (set to 22 if --port is not used).
-        target_servers = []
-        for _, target in enumerate(aconf.target_list):
+        target_servers: List[Tuple[str, int, str, Optional[Dict[str, object]]]] = []
+        for target_index, target in enumerate(aconf.target_list):
             host, port = Utils.parse_host_and_port(target, default_port=aconf.port)
-            target_servers.append((host, port))
+            sarif_location = None
+            if sarif_writer is not None:
+                if target_index < len(aconf.target_locations):
+                    line, start_column, end_column = aconf.target_locations[target_index]
+                else:
+                    line, start_column, end_column = target_index + 1, 1, len(target) + 1
+                sarif_location = _sarif_location(aconf, repo_root, target, line, start_column, end_column)
+            target_servers.append((host, port, target, sarif_location))
 
         # A ranked list of return codes.  Those with higher indices will take precedence over lower ones.  For example, if three servers are scanned, yielding WARNING, GOOD, and UNKNOWN_ERROR, the overall result will be UNKNOWN_ERROR, since its index is the highest.  Errors have highest priority, followed by failures, then warnings.
         ranked_return_codes = [exitcodes.GOOD, exitcodes.WARNING, exitcodes.FAILURE, exitcodes.CONNECTION_ERROR, exitcodes.UNKNOWN_ERROR]
@@ -1497,7 +1610,10 @@ def main() -> int:
         num_processed = 0
         out.v("Scanning %u targets with %s%u threads..." % (num_target_servers, '(at most) ' if aconf.threads > num_target_servers else '',  aconf.threads), write_now=True)
         with concurrent.futures.ThreadPoolExecutor(max_workers=aconf.threads) as executor:
-            future_to_server = {executor.submit(target_worker_thread, target_server[0], target_server[1], aconf): target_server for target_server in target_servers}
+            future_to_server = {
+                executor.submit(target_worker_thread, target_server[0], target_server[1], aconf, sarif_writer, target_server[3], target_server[2]): target_server
+                for target_server in target_servers
+            }
             for future in concurrent.futures.as_completed(future_to_server):
                 worker_ret, worker_output = future.result()
 
@@ -1519,12 +1635,54 @@ def main() -> int:
         if aconf.json:
             print(']')
 
+        if sarif_writer is not None:
+            if ret in (exitcodes.CONNECTION_ERROR, exitcodes.UNKNOWN_ERROR):
+                out.fail('(sarif) failure: one or more target invocations failed', write_now=True)
+            try:
+                sarif_writer.finalize(True)
+            except Exception as err:
+                sarif_writer.cleanup()
+                out.fail('(sarif) failure: %s' % str(err), write_now=True)
+                ret = exitcodes.UNKNOWN_ERROR
+            else:
+                out.info('(sarif) exit: wrote %s' % os.path.basename(str(aconf.sarif_output)))
+                out.write()
+
         # Send notification that this thread is exiting.  This deletes the thread's local copy of the algorithm databases.
         SSH2_KexDB.thread_exit()
 
-    else:  # Just a scan against a single target.
+    elif sarif_writer is None:  # Just a scan against a single target without SARIF.
         ret = audit(out, aconf)
         out.write()
+    else:  # A single target with SARIF output.
+        target = '%s:%d' % (aconf.host, aconf.port)
+        location = _sarif_location(aconf, repo_root, target, 1, 1, len(target) + 1)
+        invocation_id = sarif_writer.begin_invocation('ssh-audit', target)
+        out.finding_recorder = sarif_writer.recorder(location, target)
+        try:
+            ret = audit(out, aconf, sarif_writer=sarif_writer, sarif_location=location, sarif_target=target)
+        except SystemExit as err:
+            sarif_writer.finish_invocation(invocation_id, False, err.code if isinstance(err.code, int) else exitcodes.UNKNOWN_ERROR, _sarif_failure_text(err))
+            _fail_sarif_writer(out, sarif_writer, _sarif_failure_text(err))
+            raise
+        except BaseException as err:
+            sarif_writer.finish_invocation(invocation_id, False, exitcodes.UNKNOWN_ERROR, _sarif_failure_text(err))
+            _fail_sarif_writer(out, sarif_writer, _sarif_failure_text(err))
+            raise
+        else:
+            success = _sarif_execution_succeeded(ret)
+            sarif_writer.finish_invocation(invocation_id, success, ret, '' if success else 'connection or audit execution failed')
+            if not success:
+                out.fail('(sarif) failure: connection or audit execution failed', write_now=True)
+            try:
+                sarif_writer.finalize(True)
+            except Exception as err:
+                sarif_writer.cleanup()
+                out.fail('(sarif) failure: %s' % str(err), write_now=True)
+                ret = exitcodes.UNKNOWN_ERROR
+            else:
+                out.info('(sarif) exit: wrote %s' % os.path.basename(str(aconf.sarif_output)))
+            out.write()
 
     return ret
 

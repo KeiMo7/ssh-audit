@@ -47,7 +47,8 @@ usage: ssh-audit.py [-h] [-4] [-6] [-b] [-c] [-d]
                     [-p N] [-T targets.txt] [-t N] [-v]
                     [--conn-rate-test N[:max_rate]] [--dheat N[:kex[:e_len]]]
                     [--get-hardening-guide platform] [--list-hardening-guides]
-                    [--lookup alg1[,alg2,...]] [--skip-rate-test]
+                    [--lookup alg1[,alg2,...]] [--sarif FILE]
+                    [--sarif-baseline FILE] [--skip-rate-test]
                     [--socks5 host:port] [--threads N]
                     [host]
 
@@ -126,6 +127,12 @@ optional arguments:
   --lookup alg1[,alg2,...]
                         looks up an algorithm(s) without connecting to a
                         server.
+  --sarif FILE, --sarif-output FILE
+                        write SARIF 2.1.0 results to FILE (existing SARIF at
+                        the same path is used as the baseline)
+  --sarif-baseline FILE
+                        compare SARIF output against a prior SARIF file to set
+                        baselineState
   --skip-rate-test      skip the connection rate test during standard audits
                         (used to safely infer whether the DHEat attack is
                         viable)
@@ -147,6 +154,42 @@ ssh-audit ::1
 ssh-audit [::1]:222
 ssh-audit unix:///run/ssh-unix-local/socket
 ```
+
+### SARIF output
+
+SARIF 2.1.0 output is opt-in and does not change terminal, JSON, summary, or
+exit-code behavior unless `--sarif` is supplied:
+
+```
+ssh-audit --sarif reports/ssh-audit.sarif --skip-rate-test target.example
+```
+
+When `-T/--targets` is used, every finding points at the corresponding target
+line in that file, including blank-line-adjusted line numbers.  A single target
+uses a stable virtual path under `ssh-audit-targets/`.  Artifact URIs are always
+relative to the repository root; paths outside the root, non-UTF-8 paths,
+symlinks that cannot be represented safely, and over-long paths are replaced
+with deterministic `external/<sha256>.target` URIs.
+
+To compare two audits, either name the same output path (the previous valid
+SARIF file is read automatically before replacement) or pass an explicit
+baseline:
+
+```
+ssh-audit --sarif reports/current.sarif \
+  --sarif-baseline reports/previous.sarif \
+  --skip-rate-test target.example
+```
+
+Findings present in both runs have `baselineState: "unchanged"`; new findings
+have `baselineState: "new"`.  A scan failure produces either no output file or
+a schema-valid SARIF file whose invocation has
+`executionSuccessful: false`.  Results are spooled to a temporary file and
+atomically renamed, so a partial JSON document is never published.
+
+Migration note: the new options default to unset, which preserves the previous
+behavior exactly.  Add `--sarif` only to jobs that consume SARIF; no existing
+configuration needs to change.
 
 To run a standard audit against many servers (place targets into servers.txt, one on each line in the format of `HOST[:PORT]`):
 

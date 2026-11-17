@@ -137,6 +137,16 @@ The TCP port to connect to when auditing a server, or the port to listen on when
 Runs a policy audit against a target using the specified policy (see \fBPOLICY AUDIT\fP section for detailed description of this mode of operation).  Combine with -c/--client-audit to audit a client configuration instead of a server.  Use -L/--list-policies to list all official, built-in policies for common systems.
 
 .TP
+.B     \-\-sarif=FILE
+.br
+Writes SARIF 2.1.0 results to FILE.  If FILE already contains valid SARIF, that document is used as the baseline before it is atomically replaced.  This option is off by default and does not alter terminal, JSON, summary, or exit-code behavior when omitted.
+
+.TP
+.B     \-\-sarif\-baseline=FILE
+.br
+Compares the current SARIF results against a prior SARIF file and sets each result's baselineState to "new" or "unchanged".  Requires \-\-sarif.  When scanning multiple targets with \-T/\-\-targets, result locations refer to the corresponding target-list line.  Artifact URIs are relative to the repository root; external, non-UTF-8, symlinked, or over-long paths are represented by deterministic relative fallback URIs.
+
+.TP
 .B     \-\-skip\-rate\-test
 .br
 Skips the connection rate test during standard audits.  By default, a few dozen TCP connections are created with the target host to see if connection throttling is implemented (this can safely infer whether the target is vulnerable to the DHEat attack; see CVE-2002-20001).
@@ -175,6 +185,19 @@ Show version and exit.
 .SH STANDARD AUDIT
 .PP
 By default, \fBssh-audit\fP performs a standard audit.  That is, it enumerates all host key types, key exchanges, ciphers, MACs, and other information, then color-codes them in output to the user.  Cryptographic primitives with potential issues are displayed in yellow; primitives with serious flaws are displayed in red.
+
+.SH SARIF AUDIT
+.PP
+SARIF output is enabled explicitly with \-\-sarif=FILE.  Findings with fail, warning, and informational severity map to the SARIF levels error, warning, and note, respectively.  Results are written incrementally through a temporary spool and the final document is atomically renamed into place, so failures cannot leave a truncated JSON file.
+.PP
+For repeated audits, use the same output path or provide \-\-sarif\-baseline=PREVIOUS_SARIF.  Existing findings are marked "unchanged" and newly introduced findings are marked "new".  A failed scan is represented by an invocation with executionSuccessful set to false, or by no output file if the SARIF document itself could not be completed.
+.PP
+Example:
+.PP
+.nf
+ssh-audit --sarif reports/current.sarif \\
+  --sarif-baseline reports/previous.sarif target.example
+.fi
 
 
 .SH POLICY AUDIT
