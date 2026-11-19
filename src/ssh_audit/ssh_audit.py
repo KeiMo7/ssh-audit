@@ -46,6 +46,8 @@ from ssh_audit.algorithm import Algorithm
 from ssh_audit.algorithms import Algorithms
 from ssh_audit.auditconf import AuditConf
 from ssh_audit.banner import Banner
+from ssh_audit import baseline as baseline_mod
+from ssh_audit.baseline import Baseline, BaselineError, ExceptionRegistry
 from ssh_audit.dheat import DHEat
 from ssh_audit import exitcodes
 from ssh_audit.fingerprint import Fingerprint
@@ -503,7 +505,7 @@ def post_process_findings(banner: Optional[Banner], algs: Algorithms, client_aud
 
 
 # Returns a exitcodes.* flag to denote if any failures or warnings were encountered.
-def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header: List[str], client_host: Optional[str] = None, kex: Optional[SSH2_Kex] = None, print_target: bool = False, dh_rate_test_notes: str = "") -> int:
+def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header: List[str], client_host: Optional[str] = None, kex: Optional[SSH2_Kex] = None, print_target: bool = False, dh_rate_test_notes: str = "", scan_meta: Optional[Dict[str, Any]] = None, baseline_result: Optional[Dict[str, Any]] = None) -> int:
 
     program_retval = exitcodes.GOOD
     client_audit = client_host is not None  # If set, this is a client audit.
@@ -583,11 +585,73 @@ def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header
     if aconf.json:
         out.reset()
         # Build & write the JSON struct.
-        out.info(json.dumps(build_struct(aconf.host + ":" + str(aconf.port), banner, kex=kex, client_host=client_host, software=software, algorithms=algs, algorithm_recommendation_suppress_list=algorithm_recommendation_suppress_list, additional_notes=additional_notes), indent=4 if aconf.json_print_indent else None, sort_keys=True))
+        out.info(json.dumps(build_struct(aconf.host + ":" + str(aconf.port), banner, kex=kex, client_host=client_host, software=software, algorithms=algs, algorithm_recommendation_suppress_list=algorithm_recommendation_suppress_list, additional_notes=additional_notes, scan_meta=scan_meta, baseline_result=baseline_result), indent=4 if aconf.json_print_indent else None, sort_keys=True))
     elif len(unknown_algorithms) > 0:  # If we encountered any unknown algorithms, ask the user to report them.
         out.warn("\n\n!!! WARNING: unknown algorithm(s) found!: %s.  If this is the latest version of ssh-audit (see <https://github.com/jtesta/ssh-audit/releases>), please create a new Github issue at <https://github.com/jtesta/ssh-audit/issues> with the full output above.\n" % ','.join(unknown_algorithms))
 
     return program_retval
+
+
+def output_baseline_comparison(out: OutputBuffer, baseline_result: Dict[str, Any]) -> None:
+    '''Renders the historical baseline comparison as a human-readable section.  JSON consumers use the 'baseline_comparison' block instead.'''
+
+    out.head('# baseline comparison')
+    status = baseline_result.get('status')
+    if status == baseline_mod.STATUS_NO_BASELINE:
+        out.good("No baseline available; this scan is recorded as the initial baseline (re-run with this JSON output as --baseline to start regression tracking).")
+        out.sep()
+        return
+    if status == baseline_mod.STATUS_INCOMPARABLE:
+        out.fail("Cannot compare against baseline: %s" % baseline_result.get('reason'))
+        out.sep()
+        return
+
+    out.info("Mode: %s" % baseline_result.get('mode'))
+    baseline_summary = baseline_result.get('baseline') or {}
+    if baseline_summary.get('generated_at'):
+        out.info("Baseline generated at: %s" % baseline_summary.get('generated_at'))
+
+    diffs = baseline_result.get('diffs', [])
+    if len(diffs) == 0:
+        out.good("No differences relative to the baseline.")
+    else:
+        type_labels = {
+            baseline_mod.DIFF_WEAK_ALG_ADDED: 'WEAK ALGORITHM ADDED',
+            baseline_mod.DIFF_WARN_ALG_ADDED: 'WARNING-LEVEL ALGORITHM ADDED',
+            baseline_mod.DIFF_ALG_ADDED: 'algorithm added',
+            baseline_mod.DIFF_STRONG_ALG_REMOVED: 'STRONG ALGORITHM REMOVED',
+            baseline_mod.DIFF_WARN_ALG_REMOVED: 'warning-level algorithm removed',
+            baseline_mod.DIFF_WEAK_ALG_REMOVED: 'weak algorithm removed (hardening)',
+            baseline_mod.DIFF_REORDER: 'algorithm order changed',
+            baseline_mod.DIFF_KEY_SIZE_DECREASED: 'KEY SIZE DECREASED',
+            baseline_mod.DIFF_KEY_SIZE_INCREASED: 'key size increased (hardening)',
+            baseline_mod.DIFF_FINGERPRINT_CHANGED: 'host key fingerprint changed',
+            baseline_mod.DIFF_BANNER_CHANGED: 'banner changed',
+        }
+        for diff in diffs:
+            label = type_labels.get(diff['type'], diff['type'])
+            target_name = diff['algorithm'] if diff['algorithm'] else ''
+            line = "  * [%s] %s %s" % (diff['section'], label, target_name)
+            if diff['type'] == baseline_mod.DIFF_KEY_SIZE_DECREASED or diff['type'] == baseline_mod.DIFF_KEY_SIZE_INCREASED:
+                line += " (%s: %s -> %s bits)" % (diff.get('size_field'), diff.get('old_size'), diff.get('new_size'))
+            if diff.get('exception'):
+                out.warn(line + "  [regression suppressed by exception: %s (expires %s)]" % (diff['exception']['reason'], diff['exception']['expires']))
+            elif diff['is_regression']:
+                out.fail(line + "  [REGRESSION]")
+            else:
+                out.good(line)
+
+    for note in baseline_result.get('notes', []):
+        out.info("  note: %s" % note)
+
+    for conflict in baseline_result.get('exception_conflicts', []):
+        out.warn("  exception conflict for %s/%s/%s: duplicate registration; kept entry expiring %s, discarded entry expiring %s." % (conflict['target'], conflict['type'], conflict['algorithm'], conflict['kept']['expires'], conflict['discarded']['expires']))
+
+    for expired in baseline_result.get('expired_exceptions', []):
+        out.warn("  exception expired: %s/%s/%s (expired at %s); it no longer suppresses regressions." % (expired['target'], expired['type'], expired['algorithm'], expired['expires']))
+
+    out.info("Regressions: %d" % baseline_result.get('regression_count', 0))
+    out.sep()
 
 
 def evaluate_policy(out: OutputBuffer, aconf: AuditConf, banner: Optional['Banner'], client_host: Optional[str], kex: Optional['SSH2_Kex'] = None) -> bool:
@@ -789,6 +853,9 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     parser.add_argument("-V", "--version", action="store_true", dest="version", default=False, help="show version and exit")
 
     # Add long options to the parser
+    parser.add_argument("--baseline", action="store", dest="baseline", metavar="baseline.json", type=str, default=None, help="path to a machine-readable scan result (-j/--json output) from a previous run, used as the historical baseline for regression comparison")
+    parser.add_argument("--exceptions", action="store", dest="exceptions", metavar="exceptions.json", type=str, default=None, help="path to a JSON file of scoped, time-limited exceptions (each entry needs target, type, algorithm, reason and a timezone-aware expires value); matching regressions are suppressed but reported")
+    parser.add_argument("--baseline-mode", action="store", dest="baseline_mode", type=str, choices=["strict", "lenient"], default="strict", help="regression strictness for the baseline comparison: strict counts reorderings and warning-level changes as regressions, lenient only counts security-negative changes such as new weak algorithms, removed strong algorithms and shortened keys (default: %(default)s)")
     parser.add_argument("--conn-rate-test", action="store", dest="conn_rate_test", metavar="N[:max_rate]", type=str, default=None, help="perform a connection rate test (useful for collecting metrics related to susceptibility of the DHEat vuln). Testing is conducted with N concurrent sockets with an optional maximum rate of connections per second")
     parser.add_argument("--dheat", action="store", dest="dheat", metavar="N[:kex[:e_len]]", type=str, default=None, help="continuously perform the DHEat DoS attack (CVE-2002-20001) against the target using N concurrent sockets.  Optionally, a specific key exchange algorithm can be specified instead of allowing it to be automatically chosen.  Additionally, a small length of the fake e value sent to the server can be chosen for a more efficient attack (such as 4).")
     parser.add_argument("--get-hardening-guide", action="store", metavar="platform", dest="get_hardening_guide", type=str, default=None, help="retrieves the hardening guide for the specified platform name (use --list-hardening-guides to see list of available guides).")
@@ -883,12 +950,23 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
         if argument.make_policy is not None:
             aconf.make_policy = True
             aconf.policy_file = argument.make_policy
+            if argument.baseline is not None:
+                out.fail("Error: --baseline cannot be combined with -M/--make-policy.", write_now=True)
+                sys.exit(exitcodes.UNKNOWN_ERROR)
 
         if argument.policy is not None:
             aconf.policy_file = argument.policy
 
         if argument.targets is not None:
             aconf.target_file = argument.targets
+
+        if argument.baseline is not None:
+            aconf.baseline_file = argument.baseline
+
+        if argument.exceptions is not None:
+            aconf.exceptions_file = argument.exceptions
+
+        aconf.baseline_mode = argument.baseline_mode
 
         if argument.threads is not None:
             aconf.threads = argument.threads
@@ -909,6 +987,12 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     if argument.host == "" and argument.client_audit is False and argument.targets is None and argument.list_policies is False and argument.lookup is None and argument.manual is False and argument.list_hardening_guides is False and argument.get_hardening_guide is None:
         out.fail("target host must be specified, unless -c, -m, -L, -T, --lookup or --list-hardening-guides are used", write_now=True)
         sys.exit(exitcodes.UNKNOWN_ERROR)
+
+    # Baseline comparison requires a complete standard server audit; the specialized modes below terminate before the comparison runs, so reject the combination explicitly instead of silently ignoring the baseline.
+    if aconf.baseline_file is not None:
+        if aconf.client_audit or aconf.dheat is not None or aconf.conn_rate_test_enabled or aconf.gex_test != '':
+            out.fail("Error: --baseline is only supported for standard server audits; it cannot be combined with client audits (-c), --dheat, --conn-rate-test or --gex-test.", write_now=True)
+            sys.exit(exitcodes.UNKNOWN_ERROR)
 
     if aconf.manual:
         return aconf
@@ -971,6 +1055,11 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     # If a policy file was provided, validate it.
     if (aconf.policy_file is not None) and (aconf.make_policy is False):
 
+        # Baseline comparison is a separate evaluation path and cannot be combined with policy tests.
+        if aconf.baseline_file is not None:
+            out.fail("Error: --baseline cannot be combined with a policy test (-P).  Run the policy evaluation and the historical baseline comparison as separate invocations.", write_now=True)
+            sys.exit(exitcodes.UNKNOWN_ERROR)
+
         # First, see if this is a built-in policy name.  If not, assume a file path was provided, and try to load it from disk.
         aconf.policy = Policy.load_builtin_policy(aconf.policy_file, json_output=aconf.json)
         if aconf.policy is None:
@@ -993,7 +1082,7 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     return aconf
 
 
-def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SSH2_Kex'] = None, client_host: Optional[str] = None, software: Optional[Software] = None, algorithms: Optional[Algorithms] = None, algorithm_recommendation_suppress_list: Optional[List[str]] = None, additional_notes: List[str] = []) -> Any:  # pylint: disable=dangerous-default-value
+def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SSH2_Kex'] = None, client_host: Optional[str] = None, software: Optional[Software] = None, algorithms: Optional[Algorithms] = None, algorithm_recommendation_suppress_list: Optional[List[str]] = None, additional_notes: List[str] = [], scan_meta: Optional[Dict[str, Any]] = None, baseline_result: Optional[Dict[str, Any]] = None) -> Any:  # pylint: disable=dangerous-default-value
 
     def fetch_notes(algorithm: str, alg_type: str) -> Dict[str, List[Optional[str]]]:
         '''Returns a dictionary containing the messages in the "fail", "warn", and "info" levels for this algorithm.'''
@@ -1148,7 +1237,47 @@ def build_struct(target_host: str, banner: Optional['Banner'], kex: Optional['SS
     # Add in the additional notes.
     res['additional_notes'] = additional_notes
 
+    # The scan_meta block marks this document as a self-describing baseline and is only present for invocations using --baseline.  Existing fields are never removed or renamed.
+    if scan_meta is not None:
+        res['scan_meta'] = scan_meta
+
+    # The historical baseline comparison result.  Absent when no baseline was requested.
+    if baseline_result is not None:
+        res['baseline_comparison'] = baseline_result
+
     return res
+
+
+def run_baseline_comparison(aconf: AuditConf, banner: Optional['Banner'], kex: Optional['SSH2_Kex']) -> Dict[str, Any]:
+    '''Loads the historical baseline and exception registry, compares them against the current scan and returns the machine-readable comparison result.  All failures are represented in the result (status == incomparable, with an actionable reason) instead of being silently treated as a pass.'''
+
+    target = aconf.host + ":" + str(aconf.port)
+
+    # Build the current scan document using the same machine-readable structure that is written to disk, so an output can be fed back verbatim as the next baseline.
+    current_scan = build_struct(target, banner, kex=kex)
+
+    def _fatal(reason: str, incomplete: bool = False) -> Dict[str, Any]:
+        return baseline_mod._incomparable_result(reason, aconf.baseline_mode, incomplete=incomplete)  # pylint: disable=protected-access
+
+    # A scan without all four algorithm sections is partial; missing algorithms must not be interpreted as removals.
+    if not baseline_mod.is_complete_scan(current_scan):
+        return _fatal('current scan is incomplete (one or more algorithm sections are missing); refusing to compare so missing data is not mistaken for removed algorithms', incomplete=True)
+
+    registry: Optional[ExceptionRegistry] = None
+    if aconf.exceptions_file is not None:
+        try:
+            registry = ExceptionRegistry.load(aconf.exceptions_file)
+        except BaselineError as e:
+            return _fatal(str(e))
+
+    try:
+        baseline = Baseline.load(aconf.baseline_file)
+    except BaselineError as e:
+        if isinstance(e.__cause__, FileNotFoundError):
+            # Cold start: this is the first scan for this target.
+            return baseline_mod.no_baseline_result(aconf.baseline_mode)
+        return _fatal(str(e))
+    return baseline_mod.compare_scans(baseline.scan, current_scan, mode=aconf.baseline_mode, exceptions=registry, target=target, baseline=baseline)
 
 
 # Returns one of the exitcodes.* flags.
@@ -1242,7 +1371,19 @@ def audit(out: OutputBuffer, aconf: AuditConf, print_target: bool = False) -> in
 
     # This is a standard audit scan.
     if (aconf.policy is None) and (aconf.make_policy is False):
-        program_retval = output(out, aconf, banner, header, client_host=s.client_host, kex=kex, print_target=print_target, dh_rate_test_notes=dh_rate_test_notes)
+        scan_meta = None
+        baseline_result = None
+        if aconf.baseline_file is not None:
+            baseline_result = run_baseline_comparison(aconf, banner, kex)
+            target = aconf.host + ":" + str(aconf.port)
+            scan_meta = baseline_mod.build_scan_meta(target, baseline_mod.is_complete_scan(build_struct(target, banner, kex=kex, client_host=s.client_host)))
+        program_retval = output(out, aconf, banner, header, client_host=s.client_host, kex=kex, print_target=print_target, dh_rate_test_notes=dh_rate_test_notes, scan_meta=scan_meta, baseline_result=baseline_result)
+        if baseline_result is not None:
+            if not aconf.json:
+                output_baseline_comparison(out, baseline_result)
+            comparison_retval = baseline_mod.resolve_exit_code(baseline_result)
+            # The comparison verdict takes precedence over the informational fail/warn rating of the raw scan.
+            program_retval = max(program_retval, comparison_retval)
 
     # This is a policy test.
     elif (aconf.policy is not None) and (aconf.make_policy is False):
@@ -1489,8 +1630,8 @@ def main() -> int:
             host, port = Utils.parse_host_and_port(target, default_port=aconf.port)
             target_servers.append((host, port))
 
-        # A ranked list of return codes.  Those with higher indices will take precedence over lower ones.  For example, if three servers are scanned, yielding WARNING, GOOD, and UNKNOWN_ERROR, the overall result will be UNKNOWN_ERROR, since its index is the highest.  Errors have highest priority, followed by failures, then warnings.
-        ranked_return_codes = [exitcodes.GOOD, exitcodes.WARNING, exitcodes.FAILURE, exitcodes.CONNECTION_ERROR, exitcodes.UNKNOWN_ERROR]
+        # A ranked list of return codes.  Those with higher indices will take precedence over lower ones.  For example, if three servers are scanned, yielding WARNING, GOOD, and UNKNOWN_ERROR, the overall result will be UNKNOWN_ERROR, since its index is the highest.  Errors have highest priority, followed by connection errors, incomparable baselines, regressions and policy failures, then warnings.
+        ranked_return_codes = [exitcodes.GOOD, exitcodes.WARNING, exitcodes.FAILURE, exitcodes.REGRESSION, exitcodes.EXCEPTION_ONLY, exitcodes.INCOMPARABLE, exitcodes.CONNECTION_ERROR, exitcodes.UNKNOWN_ERROR]
 
         # Queue all worker threads.
         num_target_servers = len(target_servers)

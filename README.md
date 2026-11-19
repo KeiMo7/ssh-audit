@@ -101,6 +101,22 @@ optional arguments:
                         (default: 5)
   -v, --verbose         enable verbose output
   -V, --version         show version and exit
+  --baseline baseline.json
+                        path to a machine-readable scan result (-j/--json
+                        output) from a previous run, used as the historical
+                        baseline for regression comparison
+  --exceptions exceptions.json
+                        path to a JSON file of scoped, time-limited
+                        exceptions (each entry needs target, type,
+                        algorithm, reason and a timezone-aware expires
+                        value); matching regressions are suppressed but
+                        reported
+  --baseline-mode {strict,lenient}
+                        regression strictness for the baseline comparison:
+                        strict counts reorderings and warning-level changes
+                        as regressions, lenient only counts security-negative
+                        changes such as new weak algorithms, removed strong
+                        algorithms and shortened keys (default: strict)
   --conn-rate-test N[:max_rate]
                         perform a connection rate test (useful for collecting
                         metrics related to susceptibility of the DHEat vuln).
@@ -190,6 +206,70 @@ To create a policy based on a target server (which can be manually edited):
 ssh-audit -M new_policy.txt targetserver
 ```
 
+### Historical Baseline Comparisons
+
+A single policy test only answers "does this host pass right now".  To track how a target changes between scans, save a machine-readable scan result and use it as the baseline for the next run:
+
+```
+# First run (cold start): save the JSON scan result.
+ssh-audit -j targetserver > baseline.json
+
+# Subsequent runs compare against that baseline.
+ssh-audit -j --baseline baseline.json targetserver
+```
+
+The baseline is always a previous scan result (the JSON object emitted with `-j`/`--json`), never another policy file.  Each JSON output carries a `scan_meta` block and a `baseline_comparison` block when `--baseline` is used, and can be fed back verbatim as the next baseline.
+
+Differences are classified by security direction, reusing the built-in algorithm knowledge base for all strength decisions:
+
+* `weak_algorithm_added` / `warning_algorithm_added`: new algorithms the target did not offer before.
+* `strong_algorithm_removed` / `warning_algorithm_removed`: algorithms the target stopped offering (losing a strong algorithm is a regression in every mode; dropping a weak one is reported as hardening).
+* `reorder`: the relative order of the common algorithms changed.
+* `key_size_decreased` / `key_size_increased`: host-key, CA or DH modulus sizes changed (shortening is a regression; growing keys is hardening).
+* `fingerprint_changed`: a host key was replaced, so its size comparison is marked inconclusive rather than guessed at.
+
+Comparison and policy strictness are decoupled.  Differences are always produced first; `--baseline-mode` then decides which count as regressions:
+
+* `strict` (default): reordering and warning-level changes are regressions, matching exact-match policy semantics.
+* `lenient`: only security-negative changes (new weak algorithms, removed strong algorithms, shortened keys) are regressions.
+
+#### Exceptions
+
+Known-accepted changes can be registered as exceptions.  Each exception is scoped to a target, algorithm type and algorithm, carries a reason, and **must** include an explicit expiry instant with a timezone.  Global or permanent exemptions are rejected:
+
+```
+{
+  "exceptions": [
+    {
+      "target": "targetserver:22",
+      "type": "kex",
+      "algorithm": "diffie-hellman-group14-sha1",
+      "reason": "legacy device, tracked in ticket OPS-123",
+      "expires": "2026-12-31T23:59:59+00:00"
+    }
+  ]
+}
+```
+
+```
+ssh-audit --baseline baseline.json --exceptions exceptions.json targetserver
+```
+
+A matching, unexpired exception suppresses the regression (it still appears in the output, marked as suppressed) and is reported under `exceptions_applied`.  Expired entries stop suppressing anything automatically and are listed under `expired_exceptions`.  Duplicate registrations for the same target/type/algorithm are merged deterministically (the entry with the later expiry wins) and the conflict is reported.
+
+#### Exit Codes
+
+When `--baseline` is used, the exit code distinguishes the comparison outcome (legacy exit codes for plain scans are unchanged):
+
+| Exit code | Meaning |
+| --- | --- |
+| 0 | Passed: no baseline yet (cold start), or no regressions and no exceptions applied. |
+| 4 | One or more regressions remain after exceptions were applied. |
+| 5 | No regressions remain, but at least one candidate was suppressed by an active exception. |
+| 6 | Incomparable: corrupt/unknown-version baseline, an incomplete scan, or a software-product fingerprint change.  The machine-readable `reason` field explains what to do. |
+
+Incomplete scans never treat missing sections as removed algorithms, and corrupt or unrecognized baselines are refused with an actionable message rather than silently passing.
+
 To run the DHEat CPU exhaustion DoS attack ([CVE-2002-20001](https://nvd.nist.gov/vuln/detail/CVE-2002-20001)) against a target using 10 concurrent sockets:
 ```
 ssh-audit --dheat=10 targetserver
@@ -261,6 +341,7 @@ For convenience, a web front-end on top of the command-line tool is available at
  - Added `-V`/`--version` flag to print version and terminate; credit [Christian Krause](https://github.com/wookietreiber).
  - Added `mlkem768x25519-sha256` and `sntrup761x25519-sha512` to default kex list for client tests to resolve warning message; credit [Denny Page](https://github.com/dennypage).
  - Added 1 new host key: `ssh-mldsa44-ed25519`.
+ - Added historical baseline comparisons (`--baseline`, `--exceptions`, `--baseline-mode`): regressions relative to a previous machine-readable scan are classified by security direction, scoped time-limited exceptions suppress accepted changes, and new exit codes distinguish regressions (4), exception-only results (5) and incomparable baselines (6).
 
 ### v3.9.0 (2026-07-04)
  - BIG THANKS to [realmiwi](https://github.com/realmiwi) for being the project's *very first sponsor!!*

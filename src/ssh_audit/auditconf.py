@@ -69,6 +69,11 @@ class AuditConf:
         self.conn_rate_test_target_rate = 0
         self.socks5_proxy: Optional[str] = None  # SOCKS5 proxy in "host:port" format
 
+        # Historical baseline comparison (see ssh_audit/baseline.py).
+        self.baseline_file: Optional[str] = None  # Path to a machine-readable scan result from a previous run.
+        self.exceptions_file: Optional[str] = None  # Path to a JSON file of scoped, time-limited exceptions.
+        self.baseline_mode = 'strict'  # 'strict' (reordering and warning-level changes are regressions) or 'lenient' (only security-negative changes are).
+
 
     def __setattr__(self, name: str, value: Union[str, int, float, bool, Sequence[int]]) -> None:
         valid = False
@@ -96,7 +101,11 @@ class AuditConf:
             if value == -1.0:
                 raise ValueError('invalid timeout: {}'.format(value))
             valid = True
-        elif name in ['ip_version_preference', 'lookup', 'policy_file', 'policy', 'target_file', 'target_list', 'gex_test']:
+        elif name in ['ip_version_preference', 'lookup', 'policy_file', 'policy', 'target_file', 'target_list', 'gex_test', 'baseline_file', 'exceptions_file']:
+            valid = True
+        elif name == 'baseline_mode':
+            if value not in ('strict', 'lenient'):
+                raise ValueError('invalid baseline mode: {}'.format(value))
             valid = True
         elif name == "threads":
             valid, num_threads = True, Utils.parse_int(value)

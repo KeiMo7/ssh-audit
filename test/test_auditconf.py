@@ -181,3 +181,41 @@ class TestAuditConf:
 
         with pytest.raises(SystemExit):
             c('--socks5 localhost:65536 localhost')
+
+    def test_audit_conf_baseline_defaults(self):
+        conf = self.AuditConf()
+        assert conf.baseline_file is None
+        assert conf.exceptions_file is None
+        assert conf.baseline_mode == 'strict'
+
+    def test_audit_conf_baseline_mode_validation(self):
+        conf = self.AuditConf()
+        conf.baseline_mode = 'lenient'
+        assert conf.baseline_mode == 'lenient'
+        with pytest.raises(ValueError):
+            conf.baseline_mode = 'bogus'
+
+    def test_audit_conf_process_commandline_baseline(self):
+        c = lambda x: self.process_commandline(self.OutputBuffer, x.split())  # noqa
+
+        conf = c('--baseline base.json --exceptions exc.json --baseline-mode lenient localhost')
+        assert conf.baseline_file == 'base.json'
+        assert conf.exceptions_file == 'exc.json'
+        assert conf.baseline_mode == 'lenient'
+
+        with pytest.raises(SystemExit):
+            c('--baseline-mode bogus localhost')
+
+    def test_audit_conf_baseline_conflicts_with_policy(self):
+        c = lambda x: self.process_commandline(self.OutputBuffer, x.split())  # noqa
+        with pytest.raises(SystemExit):
+            c('--baseline base.json -P somepolicy localhost')
+
+    def test_audit_conf_baseline_conflicts_with_specialized_modes(self):
+        c = lambda x: self.process_commandline(self.OutputBuffer, x.split())  # noqa
+        with pytest.raises(SystemExit):
+            c('--baseline base.json --dheat 4 localhost')
+        with pytest.raises(SystemExit):
+            c('--baseline base.json -g 1024-2048 localhost')
+        with pytest.raises(SystemExit):
+            c('--baseline base.json -c localhost')
