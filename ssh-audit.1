@@ -137,6 +137,26 @@ The TCP port to connect to when auditing a server, or the port to listen on when
 Runs a policy audit against a target using the specified policy (see \fBPOLICY AUDIT\fP section for detailed description of this mode of operation).  Combine with -c/--client-audit to audit a client configuration instead of a server.  Use -L/--list-policies to list all official, built-in policies for common systems.
 
 .TP
+.B     \-\-remediation
+.br
+Derives an executable remediation plan from the failure(s) of a policy audit.  Requires -P/--policy.  Every plan item is derived from the policy and points back to the policy check(s) that produced it; checks that pass produce no suggestion.  The target's configuration is never modified.
+
+.TP
+.B     \-\-remediation\-format=<FORMAT>
+.br
+Selects the output format for the remediation plan or verification report: "text" (default) or "json".  Both forms contain the same items, one-to-one.
+
+.TP
+.B     \-\-remediation\-out=<FILE>
+.br
+Writes the remediation plan or verification report to FILE.  When omitted, the plan is written to standard output.
+
+.TP
+.B     \-\-remediation\-verify=<PLAN_FILE>
+.br
+Rescans the target and verifies it against a plan previously written with --remediation-out.  Requires -P/--policy.  Each item is reported as converged, not converged (with the remaining difference), or unable to confirm.  A target that is unreachable, whose handshake fails, or whose fingerprint does not match the original scan is never considered converged.
+
+.TP
 .B     \-\-skip\-rate\-test
 .br
 Skips the connection rate test during standard audits.  By default, a few dozen TCP connections are created with the target host to see if connection throttling is implemented (this can safely infer whether the target is vulnerable to the DHEat attack; see CVE-2002-20001).
@@ -183,6 +203,9 @@ When the -P/--policy option is used, \fBssh-audit\fP performs a policy audit.  T
 
 .PP
 Policy auditing is helpful for ensuring a group of related servers are properly hardened to an exact specification.
+
+.PP
+When a policy audit fails, --remediation generates an executable remediation plan that is derived from the policy itself: for each failed check it states the configuration directive to apply, the algorithms to enable and disable, and whether exact ordering is required.  After applying the changes, --remediation-verify rescans the target and reports which items converged, which did not (with the remaining difference), and which could not be confirmed.  Verification re-uses the same policy rules as the original evaluation; a target whose fingerprint does not match the original scan, or that cannot be negotiated with, is never reported as converged.
 
 .PP
 The set of official built-in policies can be viewed with -L/--list-policies.  Multiple servers can be audited with -T/--targets=<servers.txt>.  Custom policies can be made from an ideal target server with -M/--make-policy=<custom_policy.txt>.

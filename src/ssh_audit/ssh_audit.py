@@ -53,6 +53,7 @@ from ssh_audit.gextest import GEXTest
 from ssh_audit.hostkeytest import HostKeyTest
 from ssh_audit.outputbuffer import OutputBuffer
 from ssh_audit.policy import Policy
+from ssh_audit.remediation import Remediation, RemediationError
 from ssh_audit.hardening_guides import Hardening_Guides
 from ssh_audit.product import Product
 from ssh_audit.protocol import Protocol
@@ -590,6 +591,121 @@ def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header
     return program_retval
 
 
+def remediation_requirements(aconf: AuditConf) -> Dict[str, Any]:
+    '''Returns the policy requirements that a remediation scan needs to satisfy, whether it is generating or verifying a plan.'''
+
+    if aconf.remediation_verify is not None:
+        if aconf.remediation_plan is None or 'policy' not in aconf.remediation_plan or 'requirements' not in aconf.remediation_plan['policy']:
+            return {}
+        return Policy.from_requirements(aconf.remediation_plan['policy']['requirements']).get_requirements()
+    if aconf.policy is None:
+        return {}
+    return aconf.policy.get_requirements()
+
+
+def remediation_scan(out: OutputBuffer, aconf: AuditConf) -> int:
+    '''Rescans the target, then generates or verifies a remediation plan.  Only read-only protocol exchanges are performed: no
+    configuration is modified and no local command is executed.  Returns an exitcodes.* flag.'''
+
+    s = SSH_Socket(out, aconf.host, aconf.port, aconf.ip_version_preference, aconf.timeout, aconf.timeout_set, aconf.socks5_proxy)
+    err = s.connect()
+    banner = None
+    kex = None
+    scan_error = err
+
+    if err is None:
+        banner, header, err = s.get_banner()
+        if err is not None:
+            scan_error = err
+        if banner is not None:
+            s.send_kexinit()
+            packet_type, payload = s.read_packet()
+            if packet_type != Protocol.MSG_KEXINIT:
+                scan_error = 'did not receive a key exchange packet from the target'
+            else:
+                try:
+                    kex = SSH2_Kex.parse(out, payload)
+                except Exception:
+                    scan_error = 'failed to parse the target\'s key exchange packet'
+                else:
+                    # Host key sizes and group exchange moduli are only observable through the (read-only) DH tests.  Run them only
+                    # when the policy actually constrains these values, so that no extra work is performed otherwise.  They are
+                    # read-only and never modify the target.  Their output goes to a private buffer so that the remediation output
+                    # stays clean.
+                    requirements = remediation_requirements(aconf)
+                    if requirements.get('hostkey_sizes') or requirements.get('dh_modulus_sizes'):
+                        side_output = OutputBuffer()
+                        side_output.use_colors = False
+                        try:
+                            if requirements.get('hostkey_sizes'):
+                                HostKeyTest.run(side_output, s, kex)
+                            if requirements.get('dh_modulus_sizes'):
+                                GEXTest.run(side_output, s, banner, kex)
+                        except Exception:
+                            # Missing key-size data is reported as "insufficient basis" by the planner; it is not a hard failure.
+                            out.d('Exception while collecting key size data: %s' % traceback.format_exc())
+    s.close()
+
+    # Verification mode: compare the rescan against a previously generated plan.
+    if aconf.remediation_verify is not None:
+        if aconf.remediation_plan is None:
+            out.fail('Error: no remediation plan was loaded.', write_now=True)
+            return exitcodes.UNKNOWN_ERROR
+        try:
+            report = Remediation.verify(aconf.remediation_plan, aconf.host, aconf.port, banner, kex, scan_error=scan_error)
+        except RemediationError as e:
+            out.fail('Error while verifying remediation plan: %s' % str(e), write_now=True)
+            return exitcodes.UNKNOWN_ERROR
+
+        rendered = Remediation.verification_to_json(report) if aconf.remediation_format == 'json' else Remediation.verification_to_text(report)
+        if not write_remediation_output(out, aconf, rendered):
+            return exitcodes.UNKNOWN_ERROR
+
+        if report['status'] in ('converged', 'no_action_needed'):
+            return exitcodes.GOOD
+        if report['status'] in ('unable_to_confirm', 'fingerprint_mismatch'):
+            return exitcodes.CONNECTION_ERROR
+        return exitcodes.FAILURE
+
+    # Generation mode.
+    if aconf.policy is None:
+        out.fail('Error: remediation requires a policy (-P/--policy).', write_now=True)
+        return exitcodes.UNKNOWN_ERROR
+
+    findings = aconf.policy.evaluate_findings(banner, kex)
+    try:
+        plan = Remediation(aconf.policy, findings, aconf.policy.is_server_policy(), aconf.host, aconf.port, banner, kex).build()
+    except RemediationError as e:
+        out.fail('Error while generating remediation plan: %s' % str(e), write_now=True)
+        return exitcodes.UNKNOWN_ERROR
+
+    rendered = Remediation.to_json(plan) if aconf.remediation_format == 'json' else Remediation.to_text(plan)
+    if not write_remediation_output(out, aconf, rendered):
+        return exitcodes.UNKNOWN_ERROR
+
+    if plan['status'] == 'insufficient_basis':
+        return exitcodes.CONNECTION_ERROR
+    return exitcodes.GOOD if plan['no_action_needed'] else exitcodes.FAILURE
+
+
+def write_remediation_output(out: OutputBuffer, aconf: AuditConf, rendered: str) -> bool:
+    '''Writes a rendered remediation plan or verification report to the requested file, or to standard output.  Returns False if the
+    output could not be written.'''
+
+    if aconf.remediation_out is not None:
+        try:
+            with open(aconf.remediation_out, 'w', encoding='utf-8') as f:
+                f.write(rendered)
+        except OSError as e:
+            out.fail('Error while writing remediation output: %s' % str(e), write_now=True)
+            return False
+        return True
+
+    # Always show the plan, regardless of the requested minimum output level.
+    out.info(rendered, always_print=True)
+    return True
+
+
 def evaluate_policy(out: OutputBuffer, aconf: AuditConf, banner: Optional['Banner'], client_host: Optional[str], kex: Optional['SSH2_Kex'] = None) -> bool:
 
     if aconf.policy is None:
@@ -794,6 +910,10 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     parser.add_argument("--get-hardening-guide", action="store", metavar="platform", dest="get_hardening_guide", type=str, default=None, help="retrieves the hardening guide for the specified platform name (use --list-hardening-guides to see list of available guides).")
     parser.add_argument("--list-hardening-guides", action="store_true", dest="list_hardening_guides", default=False, help="list all official, built-in hardening guides for common systems.  Their full names can then be passed to --get-hardening-guide.  Add -v to this option to view hardening guide change logs and prior versions.")
     parser.add_argument("--lookup", action="store", dest="lookup", metavar="alg1[,alg2,...]", type=str, default=None, help="looks up an algorithm(s) without connecting to a server.")
+    parser.add_argument("--remediation", action="store_true", dest="remediation", default=False, help="derives an executable remediation plan from the failure(s) of a policy audit (-P).  The plan is derived from the policy itself; nothing is changed on the target.")
+    parser.add_argument("--remediation-format", action="store", dest="remediation_format", metavar="FORMAT", type=str, default="text", help="output format for the remediation plan or verification report: 'text' (default) or 'json'")
+    parser.add_argument("--remediation-out", action="store", dest="remediation_out", metavar="FILE", type=str, default=None, help="writes the remediation plan or verification report to FILE (standard output is still used when this is not given)")
+    parser.add_argument("--remediation-verify", action="store", dest="remediation_verify", metavar="PLAN_FILE", type=str, default=None, help="rescans the target and verifies it against a remediation plan previously written with --remediation-out; convergence is judged only from the observed negotiation results")
     parser.add_argument("--skip-rate-test", action="store_true", dest="skip_rate_test", default=False, help="skip the connection rate test during standard audits (used to safely infer whether the DHEat attack is viable)")
     parser.add_argument("--socks5", action="store", dest="socks5_proxy", metavar="host:port", type=str, default=None, help="connect via a SOCKS5 proxy (implies --skip-rate-test)")
     parser.add_argument("--threads", action="store", dest="threads", metavar="N", type=int, default=32, help="number of threads to use when scanning multiple targets (-T/--targets) (default: %(default)s)")
@@ -880,6 +1000,11 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
         if argument.lookup is not None:
             aconf.lookup = argument.lookup
 
+        aconf.remediation = argument.remediation
+        aconf.remediation_format = argument.remediation_format
+        aconf.remediation_out = argument.remediation_out
+        aconf.remediation_verify = argument.remediation_verify
+
         if argument.make_policy is not None:
             aconf.make_policy = True
             aconf.policy_file = argument.make_policy
@@ -909,6 +1034,24 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     if argument.host == "" and argument.client_audit is False and argument.targets is None and argument.list_policies is False and argument.lookup is None and argument.manual is False and argument.list_hardening_guides is False and argument.get_hardening_guide is None:
         out.fail("target host must be specified, unless -c, -m, -L, -T, --lookup or --list-hardening-guides are used", write_now=True)
         sys.exit(exitcodes.UNKNOWN_ERROR)
+
+    # Remediation requires a policy so that every suggestion can be derived from (and pointed back to) an evaluation finding.
+    if (aconf.remediation or aconf.remediation_verify is not None) and (argument.policy is None):
+        out.fail("--remediation and --remediation-verify require a policy (-P/--policy).", write_now=True)
+        sys.exit(exitcodes.UNKNOWN_ERROR)
+
+    # A remediation plan and its verification are two separate scans; they cannot be combined.
+    if aconf.remediation and aconf.remediation_verify is not None:
+        out.fail("--remediation and --remediation-verify cannot be used together.", write_now=True)
+        sys.exit(exitcodes.UNKNOWN_ERROR)
+
+    if aconf.remediation_verify is not None:
+        try:
+            with open(aconf.remediation_verify, 'r', encoding='utf-8') as f:
+                aconf.remediation_plan = json.load(f)
+        except (OSError, ValueError) as e:
+            out.fail("Error while loading remediation plan: %s" % str(e), write_now=True)
+            sys.exit(exitcodes.UNKNOWN_ERROR)
 
     if aconf.manual:
         return aconf
@@ -1159,6 +1302,11 @@ def audit(out: OutputBuffer, aconf: AuditConf, print_target: bool = False) -> in
     out.debug = aconf.debug
     out.level = aconf.level
     out.use_colors = aconf.colors
+
+    # Remediation planning and verification use a dedicated, minimal scan so that this flow cannot alter the existing audit output.
+    if aconf.remediation or aconf.remediation_verify is not None:
+        return remediation_scan(out, aconf)
+
     s = SSH_Socket(out, aconf.host, aconf.port, aconf.ip_version_preference, aconf.timeout, aconf.timeout_set, aconf.socks5_proxy)
 
     if aconf.client_audit:

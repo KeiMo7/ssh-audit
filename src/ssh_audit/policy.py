@@ -338,24 +338,30 @@ macs = %s
         return policy_data
 
 
-    def evaluate(self, banner: Optional['Banner'], kex: Optional['SSH2_Kex']) -> Tuple[bool, List[Dict[str, str]], str]:
-        '''Evaluates a server configuration against this policy.  Returns a tuple of a boolean (True if server adheres to policy) and an array of strings that holds error messages.'''
+    def evaluate_findings(self, banner: Optional['Banner'], kex: Optional['SSH2_Kex']) -> List[Dict[str, Any]]:
+        '''Evaluates a server configuration against this policy, returning the list of failed checks (each a dict with the same fields as used by _get_errors()).  This is the single source of truth for both the pass/fail result and for remediation planning.'''
 
-        ret = True
+        findings: List[Dict[str, Any]] = []
+
+        def _add_error(mismatched_field: str, expected_required: Optional[List[str]], expected_optional: Optional[List[str]], actual: Optional[List[str]]) -> None:
+            if expected_required is None:
+                expected_required = ['']
+            if expected_optional is None:
+                expected_optional = ['']
+            if actual is None:
+                actual = []
+            findings.append({'mismatched_field': mismatched_field, 'expected_required': expected_required, 'expected_optional': expected_optional, 'actual': actual})
 
         banner_str = str(banner)
         if (self._banner is not None) and (banner_str != self._banner):
-            ret = False
-            self._append_error('Banner', [self._banner], None, [banner_str])
+            _add_error('Banner', [self._banner], None, [banner_str])
 
         # All subsequent tests require a valid kex, so end here if we don't have one.
         if kex is None:
-            error_list, error_str = self._get_errors()
-            return ret, error_list, error_str
+            return findings
 
         if (self._compressions is not None) and (kex.server.compression != self._compressions):
-            ret = False
-            self._append_error('Compression', self._compressions, None, kex.server.compression)
+            _add_error('Compression', self._compressions, None, kex.server.compression)
 
         # If a list of optional host keys was given in the policy, remove any of its entries from the list retrieved from the server.  This allows us to do an exact comparison with the expected list below.
         pruned_host_keys = kex.key_algorithms
@@ -368,13 +374,11 @@ macs = %s
             if self._allow_hostkey_subset_and_reordering:
                 for hostkey_t in kex.key_algorithms:
                     if hostkey_t not in self._host_keys:
-                        ret = False
-                        self._append_error('Host keys', self._host_keys, self._optional_host_keys, kex.key_algorithms)
+                        _add_error('Host keys', self._host_keys, self._optional_host_keys, kex.key_algorithms)
                         break
             # The policy requires exact matching of algorithms.
             elif pruned_host_keys != self._host_keys:
-                ret = False
-                self._append_error('Host keys', self._host_keys, self._optional_host_keys, kex.key_algorithms)
+                _add_error('Host keys', self._host_keys, self._optional_host_keys, kex.key_algorithms)
 
         # Check host key sizes.
         if self._hostkey_sizes is not None:
@@ -387,8 +391,7 @@ macs = %s
                     actual_hostkey_size = cast(int, server_host_keys[hostkey_type]['hostkey_size'])
                     if (self._allow_larger_keys and actual_hostkey_size < expected_hostkey_size) or \
                        (not self._allow_larger_keys and actual_hostkey_size != expected_hostkey_size):
-                        ret = False
-                        self._append_error('Host key (%s) sizes' % hostkey_type, [str(expected_hostkey_size)], None, [str(actual_hostkey_size)])
+                        _add_error('Host key (%s) sizes' % hostkey_type, [str(expected_hostkey_size)], None, [str(actual_hostkey_size)])
 
                     # If we have expected CA signatures set, check them against what the server returned.
                     if self._hostkey_sizes is not None and len(cast(str, self._hostkey_sizes[hostkey_type]['ca_key_type'])) > 0 and cast(int, self._hostkey_sizes[hostkey_type]['ca_key_size']) > 0:
@@ -399,13 +402,11 @@ macs = %s
 
                         # Ensure that the CA signature type is what's expected (i.e.: the server doesn't have an RSA sig when we're expecting an ED25519 sig).
                         if actual_ca_key_type != expected_ca_key_type:
-                            ret = False
-                            self._append_error('CA signature type', [expected_ca_key_type], None, [actual_ca_key_type])
+                            _add_error('CA signature type', [expected_ca_key_type], None, [actual_ca_key_type])
                         # Ensure that the actual and expected signature sizes match.
                         elif (self._allow_larger_keys and actual_ca_key_size < expected_ca_key_size) or \
                              (not self._allow_larger_keys and actual_ca_key_size != expected_ca_key_size):
-                            ret = False
-                            self._append_error('CA signature size (%s)' % actual_ca_key_type, [str(expected_ca_key_size)], None, [str(actual_ca_key_size)])
+                            _add_error('CA signature size (%s)' % actual_ca_key_type, [str(expected_ca_key_size)], None, [str(actual_ca_key_size)])
 
         # Check key exchanges.
         if self._kex is not None:
@@ -413,19 +414,16 @@ macs = %s
             if self._allow_algorithm_subset_and_reordering:
                 for kex_t in kex.kex_algorithms:
                     if kex_t not in self._kex:
-                        ret = False
-                        self._append_error('Key exchanges', self._kex, None, kex.kex_algorithms)
+                        _add_error('Key exchanges', self._kex, None, kex.kex_algorithms)
                         break
                 # If kex-strict-?-v00@openssh.com is in the policy (i.e. the Terrapin vulnerability countermeasure), then it must appear in the server's list, regardless of the "allow_algorithm_subset_and_reordering" flag.
                 if ('kex-strict-s-v00@openssh.com' in self._kex and 'kex-strict-s-v00@openssh.com' not in kex.kex_algorithms) or \
                    ('kex-strict-c-v00@openssh.com' in self._kex and 'kex-strict-c-v00@openssh.com' not in kex.kex_algorithms):
-                    ret = False
-                    self._append_error('Key exchanges', self._kex, None, kex.kex_algorithms)
+                    _add_error('Key exchanges', self._kex, None, kex.kex_algorithms)
 
             # The policy requires exact matching of algorithms.
             elif kex.kex_algorithms != self._kex:
-                ret = False
-                self._append_error('Key exchanges', self._kex, None, kex.kex_algorithms)
+                _add_error('Key exchanges', self._kex, None, kex.kex_algorithms)
 
         # Checking Ciphers
         if self._ciphers is not None:
@@ -433,13 +431,11 @@ macs = %s
             if self._allow_algorithm_subset_and_reordering:
                 for cipher_t in kex.server.encryption:
                     if cipher_t not in self._ciphers:
-                        ret = False
-                        self._append_error('Ciphers', self._ciphers, None, kex.server.encryption)
+                        _add_error('Ciphers', self._ciphers, None, kex.server.encryption)
                         break
             # The policy requires exact matching of algorithms.
             elif kex.server.encryption != self._ciphers:
-                ret = False
-                self._append_error('Ciphers', self._ciphers, None, kex.server.encryption)
+                _add_error('Ciphers', self._ciphers, None, kex.server.encryption)
 
         # Checking MACs
         if self._macs is not None:
@@ -447,13 +443,11 @@ macs = %s
             if self._allow_algorithm_subset_and_reordering:
                 for mac_t in kex.server.mac:
                     if mac_t not in self._macs:
-                        ret = False
-                        self._append_error('MACs', self._macs, None, kex.server.mac)
+                        _add_error('MACs', self._macs, None, kex.server.mac)
                         break
             # The policy requires exact matching of algorithms.
             elif kex.server.mac != self._macs:
-                ret = False
-                self._append_error('MACs', self._macs, None, kex.server.mac)
+                _add_error('MACs', self._macs, None, kex.server.mac)
 
         if self._dh_modulus_sizes is not None:
             dh_modulus_types = list(self._dh_modulus_sizes.keys())
@@ -464,8 +458,22 @@ macs = %s
                     actual_dh_modulus_size = kex.dh_modulus_sizes()[dh_modulus_type]
                     if (self._allow_larger_keys and actual_dh_modulus_size < expected_dh_modulus_size) or \
                        (not self._allow_larger_keys and actual_dh_modulus_size != expected_dh_modulus_size):
-                        ret = False
-                        self._append_error('Group exchange (%s) modulus sizes' % dh_modulus_type, [str(expected_dh_modulus_size)], None, [str(actual_dh_modulus_size)])
+                        _add_error('Group exchange (%s) modulus sizes' % dh_modulus_type, [str(expected_dh_modulus_size)], None, [str(actual_dh_modulus_size)])
+
+        return findings
+
+
+    def evaluate(self, banner: Optional['Banner'], kex: Optional['SSH2_Kex']) -> Tuple[bool, List[Dict[str, str]], str]:
+        '''Evaluates a server configuration against this policy.  Returns a tuple of a boolean (True if server adheres to policy) and an array of strings that holds error messages.'''
+
+        ret = True
+
+        # Clear any errors left over from a previous evaluation, then evaluate.  Both the pass/fail result and the remediation
+        # planner use evaluate_findings(), so there is a single definition of "compliant".
+        self._errors = []
+        for finding in self.evaluate_findings(banner, kex):
+            self._append_error(finding['mismatched_field'], finding['expected_required'], finding['expected_optional'], finding['actual'])
+            ret = False
 
         error_list, error_str = self._get_errors()
         return ret, error_list, error_str
@@ -509,6 +517,69 @@ macs = %s
     def get_name_and_version(self) -> str:
         '''Returns a string of this Policy's name and version.'''
         return self._name_and_version
+
+
+    def get_requirements(self) -> Dict[str, Any]:
+        '''Returns a read-only snapshot of every requirement this policy defines.  Used by the remediation planner; the values are deep copies so that callers cannot mutate this Policy.'''
+
+        def _copy(value: Any) -> Any:
+            if isinstance(value, dict):
+                # Raw host key bytes are neither serializable nor needed for evaluation.
+                return {k: _copy(v) for k, v in value.items() if not isinstance(v, bytes)}
+            if isinstance(value, list):
+                return [_copy(v) for v in value]
+            return copy.deepcopy(value)
+
+        return {
+            'name': self._name,
+            'version': self._version,
+            'banner': self._banner,
+            'compressions': _copy(self._compressions),
+            'host_keys': _copy(self._host_keys),
+            'optional_host_keys': _copy(self._optional_host_keys),
+            'kex': _copy(self._kex),
+            'ciphers': _copy(self._ciphers),
+            'macs': _copy(self._macs),
+            'hostkey_sizes': _copy(self._hostkey_sizes),
+            'dh_modulus_sizes': _copy(self._dh_modulus_sizes),
+            'server_policy': self._server_policy,
+            'allow_algorithm_subset_and_reordering': self._allow_algorithm_subset_and_reordering,
+            'allow_hostkey_subset_and_reordering': self._allow_hostkey_subset_and_reordering,
+            'allow_larger_keys': self._allow_larger_keys,
+        }
+
+
+    @staticmethod
+    def from_requirements(requirements: Dict[str, Any]) -> 'Policy':
+        '''Reconstructs a Policy from the snapshot returned by get_requirements().  This allows a remediation plan to be verified against the exact rules it was generated with, even if the original policy file changed in the meantime.'''
+
+        def _sanitize(value: Any) -> Any:
+            # Raw host key bytes are not serializable, and are not needed for evaluation.
+            if isinstance(value, dict):
+                return {k: _sanitize(v) for k, v in value.items() if not isinstance(v, bytes)}
+            if isinstance(value, list):
+                return [_sanitize(v) for v in value]
+            return copy.deepcopy(value)
+
+        p = Policy(manual_load=True)
+        p._name = cast(Optional[str], _sanitize(requirements['name']))  # pylint: disable=protected-access
+        p._version = cast(Optional[str], _sanitize(requirements['version']))  # pylint: disable=protected-access
+        p._banner = cast(Optional[str], _sanitize(requirements.get('banner')))  # pylint: disable=protected-access
+        p._compressions = cast(Optional[List[str]], _sanitize(requirements.get('compressions')))  # pylint: disable=protected-access
+        p._host_keys = cast(Optional[List[str]], _sanitize(requirements.get('host_keys')))  # pylint: disable=protected-access
+        p._optional_host_keys = cast(Optional[List[str]], _sanitize(requirements.get('optional_host_keys')))  # pylint: disable=protected-access
+        p._kex = cast(Optional[List[str]], _sanitize(requirements.get('kex')))  # pylint: disable=protected-access
+        p._ciphers = cast(Optional[List[str]], _sanitize(requirements.get('ciphers')))  # pylint: disable=protected-access
+        p._macs = cast(Optional[List[str]], _sanitize(requirements.get('macs')))  # pylint: disable=protected-access
+        p._hostkey_sizes = cast(Optional[Dict[str, Dict[str, Union[int, str, bytes]]]], _sanitize(requirements.get('hostkey_sizes')))  # pylint: disable=protected-access
+        p._dh_modulus_sizes = cast(Optional[Dict[str, int]], _sanitize(requirements.get('dh_modulus_sizes')))  # pylint: disable=protected-access
+        p._server_policy = bool(requirements.get('server_policy', True))  # pylint: disable=protected-access
+        p._allow_algorithm_subset_and_reordering = bool(requirements.get('allow_algorithm_subset_and_reordering', False))  # pylint: disable=protected-access
+        p._allow_hostkey_subset_and_reordering = bool(requirements.get('allow_hostkey_subset_and_reordering', False))  # pylint: disable=protected-access
+        p._allow_larger_keys = bool(requirements.get('allow_larger_keys', False))  # pylint: disable=protected-access
+        p._normalize_hostkey_sizes()  # pylint: disable=protected-access
+        p._name_and_version = "%s (version %s)" % (p._name, p._version)  # pylint: disable=protected-access
+        return p
 
 
     def is_outdated_builtin_policy(self) -> bool:

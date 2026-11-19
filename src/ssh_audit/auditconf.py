@@ -68,11 +68,16 @@ class AuditConf:
         self.conn_rate_test_threads = 0
         self.conn_rate_test_target_rate = 0
         self.socks5_proxy: Optional[str] = None  # SOCKS5 proxy in "host:port" format
+        self.remediation: bool = False  # When True, derives an executable remediation plan from the policy evaluation.
+        self.remediation_out: Optional[str] = None  # File path for the structured remediation output.
+        self.remediation_format: str = 'text'  # 'text' or 'json'.
+        self.remediation_verify: Optional[str] = None  # File path of a previously generated plan to verify a rescan against.
+        self.remediation_plan: Optional[Dict[str, Any]] = None  # Parsed remediation plan loaded from remediation_verify.
 
 
     def __setattr__(self, name: str, value: Union[str, int, float, bool, Sequence[int]]) -> None:
         valid = False
-        if name in ['batch', 'client_audit', 'colors', 'json', 'json_print_indent', 'list_policies', 'manual', 'make_policy', 'timeout_set', 'verbose', 'debug', 'skip_rate_test']:
+        if name in ['batch', 'client_audit', 'colors', 'json', 'json_print_indent', 'list_policies', 'manual', 'make_policy', 'timeout_set', 'verbose', 'debug', 'skip_rate_test', 'remediation']:
             valid, value = True, bool(value)
         elif name in ['ipv4', 'ipv6']:
             valid, value = True, bool(value)
@@ -186,12 +191,27 @@ class AuditConf:
             if not isinstance(value, int):
                 valid = False
 
-        elif name == "socks5_proxy":
+        elif name == 'socks5_proxy':
             valid = True
             if isinstance(value, str):
                 host, port = Utils.parse_host_and_port(value, 0)
                 if len(host) == 0 or port <= 0 or port >= 65535:
                     raise ValueError("SOCKS5 host must be in host:port format.")
+
+        elif name == 'remediation_format':
+            valid = True
+            if value not in ('text', 'json'):
+                raise ValueError("remediation format must be 'text' or 'json': {}".format(value))
+
+        elif name in ['remediation_out', 'remediation_verify']:
+            valid = True
+            if value is not None and not isinstance(value, str):
+                valid = False
+
+        elif name == 'remediation_plan':
+            valid = True
+            if value is not None and not isinstance(value, dict):
+                valid = False
 
         if valid:
             object.__setattr__(self, name, value)

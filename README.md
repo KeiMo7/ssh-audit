@@ -47,7 +47,11 @@ usage: ssh-audit.py [-h] [-4] [-6] [-b] [-c] [-d]
                     [-p N] [-T targets.txt] [-t N] [-v]
                     [--conn-rate-test N[:max_rate]] [--dheat N[:kex[:e_len]]]
                     [--get-hardening-guide platform] [--list-hardening-guides]
-                    [--lookup alg1[,alg2,...]] [--skip-rate-test]
+                    [--lookup alg1[,alg2,...]]
+                    [--remediation] [--remediation-format FORMAT]
+                    [--remediation-out FILE]
+                    [--remediation-verify PLAN_FILE]
+                    [--skip-rate-test]
                     [--socks5 host:port] [--threads N]
                     [host]
 
@@ -126,6 +130,22 @@ optional arguments:
   --lookup alg1[,alg2,...]
                         looks up an algorithm(s) without connecting to a
                         server.
+  --remediation         derives an executable remediation plan from the
+                        failure(s) of a policy audit (-P). The plan is derived
+                        from the policy itself; nothing is changed on the
+                        target.
+  --remediation-format FORMAT
+                        output format for the remediation plan or verification
+                        report: 'text' (default) or 'json'
+  --remediation-out FILE
+                        writes the remediation plan or verification report to
+                        FILE (standard output is still used when this is not
+                        given)
+  --remediation-verify PLAN_FILE
+                        rescans the target and verifies it against a
+                        remediation plan previously written with
+                        --remediation-out; convergence is judged only from the
+                        observed negotiation results
   --skip-rate-test      skip the connection rate test during standard audits
                         (used to safely infer whether the DHEat attack is
                         viable)
@@ -224,6 +244,23 @@ Below is a screen shot of the client-auditing output when an unhardened OpenSSH 
 
 ## Hardening Guides
 Guides to harden server & client configuration are built into the tool (see `--list-hardening-guides` and `--get-hardening-guide` options).  Additionally, they are also available online at: [https://www.ssh-audit.com/hardening_guides.html](https://www.ssh-audit.com/hardening_guides.html)
+
+## Remediation Plans
+The built-in hardening guides are static: they describe how to harden a platform in general.  When you need suggestions that match *this* scan, run a policy audit together with `--remediation`:
+
+```
+ssh-audit -P "Hardened Ubuntu Server 24.04 LTS (version 2)" --remediation --remediation-format json --remediation-out plan.json targetserver
+```
+
+The generated plan is derived entirely from the policy evaluation: every item points back to the check(s) that produced it (`Covers:` in text output, `finding_ids` in JSON), and checks that pass never produce a suggestion.  Each family of failure gets an appropriate shape: algorithm-set and cipher failures list the algorithms to enable and disable plus whether exact ordering is required, key-length failures state the required minimum size, compression failures state that compression must be disabled, and a missing strict key exchange marker gets its own entry.  When nothing needs fixing, the plan says `No remediation needed.`  If a category of negotiation data could not be observed, that category is reported as *insufficient basis* rather than guessed at.  The target's configuration is never modified; only the plan is produced.
+
+After applying the changes, rescan and verify the same plan:
+
+```
+ssh-audit -P "Hardened Ubuntu Server 24.04 LTS (version 2)" --remediation-verify plan.json targetserver
+```
+
+Verification re-uses the exact policy rules that produced the plan.  Each item is reported as converged, not converged (with the remaining difference), or unable to confirm.  A target that cannot be reached, fails the handshake, or does not return a fingerprint matching the original scan is never considered converged.
 
 ## Pre-Built Packages
 Pre-built packages are available for Windows (see the [Releases](https://github.com/jtesta/ssh-audit/releases) page), PyPI, Snap, and Docker:
