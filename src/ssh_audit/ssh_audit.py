@@ -54,6 +54,9 @@ from ssh_audit.hostkeytest import HostKeyTest
 from ssh_audit.outputbuffer import OutputBuffer
 from ssh_audit.policy import Policy
 from ssh_audit.hardening_guides import Hardening_Guides
+from ssh_audit.negotiation import analyze as negotiation_analyze
+from ssh_audit.negotiation import TestState as NegotiationTestState
+from ssh_audit.negotiation_output import output_negotiation, build_negotiation_struct
 from ssh_audit.product import Product
 from ssh_audit.protocol import Protocol
 from ssh_audit.software import Software
@@ -580,10 +583,21 @@ def output(out: OutputBuffer, aconf: AuditConf, banner: Optional[Banner], header
     perfect_config = output_recommendations(out, algs, algorithm_recommendation_suppress_list, software, aconf.json, maxlen)
     output_info(out, software, client_audit, not perfect_config, aconf.json, additional_notes)
 
+    # Additive negotiation analysis (opt-in).  This renders a separate section
+    # and never modifies the sections above, the grading colors, or the exit code.
+    negotiation_report = None
+    if aconf.negotiation:
+        negotiation_report = build_negotiation_report(kex, software, client_audit)
+        output_negotiation(out, negotiation_report, aconf.json)
+
     if aconf.json:
         out.reset()
         # Build & write the JSON struct.
-        out.info(json.dumps(build_struct(aconf.host + ":" + str(aconf.port), banner, kex=kex, client_host=client_host, software=software, algorithms=algs, algorithm_recommendation_suppress_list=algorithm_recommendation_suppress_list, additional_notes=additional_notes), indent=4 if aconf.json_print_indent else None, sort_keys=True))
+        json_struct = build_struct(aconf.host + ":" + str(aconf.port), banner, kex=kex, client_host=client_host, software=software, algorithms=algs, algorithm_recommendation_suppress_list=algorithm_recommendation_suppress_list, additional_notes=additional_notes)
+        if negotiation_report is not None:
+            # New top-level key only; all existing keys are untouched.
+            json_struct['negotiation'] = build_negotiation_struct(negotiation_report)
+        out.info(json.dumps(json_struct, indent=4 if aconf.json_print_indent else None, sort_keys=True))
     elif len(unknown_algorithms) > 0:  # If we encountered any unknown algorithms, ask the user to report them.
         out.warn("\n\n!!! WARNING: unknown algorithm(s) found!: %s.  If this is the latest version of ssh-audit (see <https://github.com/jtesta/ssh-audit/releases>), please create a new Github issue at <https://github.com/jtesta/ssh-audit/issues> with the full output above.\n" % ','.join(unknown_algorithms))
 
@@ -691,6 +705,27 @@ def get_algorithm_recommendations(algs: Optional[Algorithms], algorithm_recommen
     return ret
 
 
+def build_negotiation_report(kex: Optional[SSH2_Kex], software: Optional[Software], client_audit: bool) -> Any:
+    '''Constructs the additive negotiation analysis report.  Honors the
+    handshake test state recorded on the kex object (degradation rules 1 & 3).'''
+    for_server = not client_audit
+
+    if kex is None:
+        # Degradation rule 1: no handshake completed -> declared-list-only,
+        # explicitly marked as unverified.
+        return negotiation_analyze(None, software, for_server, test_state=NegotiationTestState.NOT_ATTEMPTED,
+                                   test_state_note='no handshake completed; conclusions are conservative and based on declared lists only')
+
+    if kex.test_state == 'incomplete':
+        test_state = NegotiationTestState.INCOMPLETE
+        note = kex.test_state_note or 'handshake tests were interrupted; partial results retained, untested items marked declared-only'
+    else:
+        test_state = NegotiationTestState.COMPLETED
+        note = ''
+
+    return negotiation_analyze(kex, software, for_server, test_state=test_state, test_state_note=note)
+
+
 def list_policies(out: OutputBuffer, verbose: bool) -> None:
     '''Prints a list of server & client policies.'''
 
@@ -780,6 +815,7 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
     parser.add_argument("-L", "--list-policies", action="store_true", dest="list_policies", default=False, help="list all the official, built-in policies. Combine with -v to view policy change logs")
     parser.add_argument("-M", "--make-policy", action="store", dest="make_policy", metavar="custom_policy.txt", type=str, default=None, help="creates a policy based on the target server (i.e.: the target server has the ideal configuration that other servers should adhere to), and stores it in the file path specified")
     parser.add_argument("-m", "--manual", action="store_true", dest="manual", default=False, help="print the man page (Docker, PyPI, Snap, and Windows builds only)")
+    parser.add_argument("--negotiation", action="store_true", dest="negotiation", default=False, help="additively report actually-negotiable algorithm combinations, version-based availability, weakness reachability grading, and traceable recommendations (existing output sections and exit codes are unchanged)")
     parser.add_argument("-n", "--no-colors", action="store_true", dest="no_colors", default=False, help="disable colors (automatic when the NO_COLOR environment variable is set)")
     parser.add_argument("-P", "--policy", action="store", dest="policy", metavar="\"Built-In Policy Name\" / custom_policy.txt", type=str, default=None, help="run a policy test using the specified policy (use -L to see built-in policies, or specify filesystem path to custom policy created by -M)")
     parser.add_argument("-p", "--port", action="store", dest="oport", metavar="N", type=int, default=None, help="the TCP port to connect to (or to listen on when -c is used)")
@@ -900,6 +936,9 @@ def process_commandline(out: OutputBuffer, args: List[str]) -> 'AuditConf':  # p
         if argument.verbose is True:
             aconf.verbose = True
             out.verbose = True
+
+        if argument.negotiation is True:
+            aconf.negotiation = True
 
     except (argparse.ArgumentError, ValueError) as err:
         out.fail(f"Error: {str(err)}", write_now=True)

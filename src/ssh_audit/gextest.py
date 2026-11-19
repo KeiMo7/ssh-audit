@@ -112,6 +112,7 @@ class GEXTest:
                 modulus_size_returned, reconnect_failed = GEXTest._send_init(out, s, kex_group, kex, gex_alg, bits_min, bits_pref, bits_max)
                 if reconnect_failed:
                     out.fail('Reconnect failed.')
+                    kex.mark_test_incomplete('GEX modulus test interrupted: reconnection failed')
                     return exitcodes.FAILURE
 
                 if modulus_size_returned > 0:
@@ -146,6 +147,7 @@ class GEXTest:
                 kex_group = kex_group_class(out)
                 smallest_modulus, reconnect_failed = GEXTest._send_init(out, s, kex_group, kex, gex_alg, 512, 1024, 1536)
                 if reconnect_failed:
+                    kex.mark_test_incomplete('GEX modulus test interrupted: reconnection failed')
                     break
 
                 # Try an array of specific modulus sizes... one at a time.

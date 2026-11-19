@@ -135,12 +135,14 @@ class HostKeyTest:
                     err = s.connect()
                     if err is not None:
                         out.v(err, write_now=True)
+                        server_kex.mark_test_incomplete('host-key test interrupted: could not reconnect to target')
                         return
 
                     _, _, err = s.get_banner()
                     if err is not None:
                         out.v(err, write_now=True)
                         s.close()
+                        server_kex.mark_test_incomplete('host-key test interrupted: did not receive banner on reconnect')
                         return
 
                     # Send our KEX using the specified group-exchange and most of the server's own values.
@@ -157,6 +159,7 @@ class HostKeyTest:
 
                         out.v(msg, write_now=True)
                         out.d("Stack trace:\n%s" % str(traceback.format_exc()), write_now=True)
+                        server_kex.mark_test_incomplete('host-key test interrupted: failed to parse server kex on reconnect')
                         return
 
                 # Do the initial DH exchange.  The server responds back

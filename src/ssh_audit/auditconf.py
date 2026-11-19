@@ -68,11 +68,12 @@ class AuditConf:
         self.conn_rate_test_threads = 0
         self.conn_rate_test_target_rate = 0
         self.socks5_proxy: Optional[str] = None  # SOCKS5 proxy in "host:port" format
+        self.negotiation = False  # When True, emit the additive negotiation analysis section / JSON key.
 
 
     def __setattr__(self, name: str, value: Union[str, int, float, bool, Sequence[int]]) -> None:
         valid = False
-        if name in ['batch', 'client_audit', 'colors', 'json', 'json_print_indent', 'list_policies', 'manual', 'make_policy', 'timeout_set', 'verbose', 'debug', 'skip_rate_test']:
+        if name in ['batch', 'client_audit', 'colors', 'json', 'json_print_indent', 'list_policies', 'manual', 'make_policy', 'timeout_set', 'verbose', 'debug', 'skip_rate_test', 'negotiation']:
             valid, value = True, bool(value)
         elif name in ['ipv4', 'ipv6']:
             valid, value = True, bool(value)

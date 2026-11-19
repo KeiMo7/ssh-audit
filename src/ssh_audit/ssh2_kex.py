@@ -45,6 +45,13 @@ class SSH2_Kex:
         self.__dh_modulus_sizes: Dict[str, int] = {}
         self.__host_keys: Dict[str, Dict[str, Union[bytes, str, int]]] = {}
 
+        # Negotiation-analysis test state (additive; defaults to 'completed'
+        # so existing callers are unaffected).  mark_test_incomplete() is
+        # invoked when a live handshake test is interrupted part-way through,
+        # allowing partial results to be retained with an explanation.
+        self.__test_state: str = 'completed'
+        self.__test_state_note: str = ''
+
     @property
     def cookie(self) -> bytes:
         return self.__cookie
@@ -90,6 +97,22 @@ class SSH2_Kex:
 
     def host_keys(self) -> Dict[str, Dict[str, Union[bytes, str, int]]]:
         return self.__host_keys
+
+    def mark_test_incomplete(self, note: str) -> None:
+        '''Records that a live handshake test (host-key or GEX) was interrupted.
+        Already-collected results are retained; only the state flag changes.'''
+        self.__test_state = 'incomplete'
+        # Keep the first explanation if incompleteness is recorded more than once.
+        if not self.__test_state_note:
+            self.__test_state_note = note
+
+    @property
+    def test_state(self) -> str:
+        return self.__test_state
+
+    @property
+    def test_state_note(self) -> str:
+        return self.__test_state_note
 
     def write(self, wbuf: 'WriteBuf') -> None:
         wbuf.write(self.cookie)
